@@ -202,6 +202,32 @@ pub enum AddressMode {
     AddressMode10bit,
 }
 
+/// Addressing mode
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum I2CDeviceMode {
+    Controller,
+    Target
+}
+
+/// Bus speed mode
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum I2CBusMode {
+    FastModePlus,
+    FastMode,
+    StandardMode,
+}
+
+/// Used for looking up constants
+impl I2CBusMode {
+    fn idx(&self) -> usize {
+        match self {
+            I2CBusMode::StandardMode => 0,
+            I2CBusMode::FastMode => 1,
+            I2CBusMode::FastModePlus => 2,
+        }
+    }
+}
+
 /// I2C error
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -486,123 +512,202 @@ impl<I2C: Instance> I2cExt<I2C> for I2C {
     }
 }
 
-fn calc_timing_params(ker_ck: u32, target_freq: u32) -> (u8, u8, u8, u8, u8) {
-    // This timing derivation is taken directly from the stm32h7xx-hal implementation
-    // (see https://github.com/stm32-rs/stm32h7xx-hal/blob/master/src/i2c.rs).
-    //
-    // The timing requirements for the I2C peripheral are quite complex and ST does not
-    // provide clear instructions for deriving them, instead referring users from the
-    // reference manual to use the STM32CubeMX tool to get the TIMINGR setting. The H7
-    // implementation is well tested, so we'll stick with it.
-    // Refer to RM0492 Rev 2 Sections 34.4.5 & 34.4.9 for timing details.
-    //
-    // t_I2CCLK = 1 / i2c_ker_ck
-    // t_PRESC  = (PRESC + 1) * t_I2CCLK
-    // t_SCLL   = (SCLL + 1) * t_PRESC
-    // t_SCLH   = (SCLH + 1) * t_PRESC
-    //
-    // t_SYNC1 + t_SYNC2 > 4 * t_I2CCLK
-    // t_SCL ~= t_SYNC1 + t_SYNC2 + t_SCLL + t_SCLH
-    let ratio = ker_ck / target_freq;
+/// Compute the I2C_TIMINGR register value.
+///
+/// Returns `(presc, scldel, sdadel, sclh, scll)` as a tuple of register fields.
+///
+/// # Arguments
+///
+/// * `ker_clk` - I2C peripheral clock frequency in Hz (e.g. 8_000_000, 48_000_000)
+/// * `target_freq` - Target I2C bus speed in Hz (e.g. 100_000, 400_000, 1_000_000)
+/// * `mode` - [`I2CBusMode`] variant: Standard Mode, Fast Mode, or Fast Mode Plus
+/// * `rise` - Expected SCL/SDA rise time in nanoseconds
+/// * `fall` - Expected SCL/SDA fall time in nanoseconds
+/// * `af_enabled` - `true` to enable the analog filter
+/// * `dnf_n` - Digital noise filter coefficient 0–15
+fn calc_timing_params_full(
+    ker_ck: u32,
+    target_freq: u32,
+    mode: I2CBusMode,
+    rise: u32,
+    fall: u32,
+    af_enabled: bool,
+    dnf_n: u32,
+    device_mode: I2CDeviceMode,
+) -> (u8, u8, u8, u8, u8) {
+    // Constants from NXP UM10204 Rev 7 §6 Table 10 and STM32H5 RM0492 §34.4.5
+    const THDDAT_MAX: [f64; 3] = [3450e-9, 900e-9, 450e-9]; // max data hold time (s)
+    const TSUDAT_MIN: [f64; 3] = [250e-9, 100e-9, 50e-9]; // min data setup time (s)
+    const TLOW_MIN: [f64; 3] = [4.7e-6, 1.3e-6, 0.5e-6]; // min SCL low period (s)
+    const THIGH_MIN: [f64; 3] = [4.0e-6, 0.6e-6, 0.26e-6]; // min SCL high period (s)
 
-    // For the standard-mode configuration method, we must have a ratio of 4
-    // or higher
-    assert!(
-        ratio >= 4,
-        "i2c_ker_ck must be at least 4 times the bus frequency!"
+    // Unit Conversions
+    let t_i2cclk = 1.0_f64 / (ker_ck as f64);
+    let rise_time = rise as f64 * 1e-9;
+    let fall_time = fall as f64 * 1e-9;
+    let idx = mode.idx();
+
+    // Filter Delays
+    let af_delay: f64 = if af_enabled { 50e-9 } else { 0.0 };
+    let af_max: f64   = if af_enabled { 260e-9 } else { 0.0 };
+    let dnf_delay = dnf_n as f64 * t_i2cclk;
+    let filter_delay = af_delay + dnf_delay;
+
+    // SDADEL / SCLDEL bounds (in seconds)
+    // SDA hold time: delay inserted before sending SDA output — see RM0492 §34.4.5
+    let sdadel_min = 0.0_f64.max(fall_time - af_delay - (dnf_n + 3) as f64 * t_i2cclk);
+    let sdadel_max = 0.0_f64.max(
+        THDDAT_MAX[idx] - rise_time - af_max - (dnf_n + 4) as f64 * t_i2cclk,
     );
+    let scldel_min = rise_time + TSUDAT_MIN[idx];
 
-    let (presc_reg, scll, sclh, sdadel, scldel) = if target_freq > 100_000 {
-        // Fast-mode (Fm) or Fast-mode Plus (Fm+)
-        // here we pick SCLL + 1 = 2 * (SCLH + 1)
+    // Phase 1: Find valid (PRESC, SCLDEL, SDADEL combinations)
+    // For each PRESC p (0..15), SCLDEL d (0..15), SDADEL a (0..15):
+    //   T_presc       = (p + 1) * T_i2cclk
+    //   SDADEL_actual = a * T_presc
+    //   SCLDEL_actual = (d + 1) * T_presc
+    // Valid when:
+    //   SDADEL_MIN <= SDADEL_actual <= SDADEL_MAX
+    //   SCLDEL_actual >= SCLDEL_MIN
+    let mut valid_presc = [0usize; 16];
+    let mut presc_seen = [false; 16];
+    let mut presc_result = [[[false; 16]; 16]; 16];
+    let mut valid_presc_len = 0;
+    for p in 0..16usize {
+        let t_presc = (p + 1) as f64 * t_i2cclk;
+        for d in 0..16usize {
+            let scldel_actual = (d + 1) as f64 * t_presc;
+            for a in 0..16usize {
+                let sdadel_actual = a as f64 * t_presc;
+                if sdadel_actual >= sdadel_min && sdadel_actual <= sdadel_max && scldel_actual >= scldel_min {
+                    presc_result[p][d][a] = true;
+                    if !presc_seen[p] {
+                        valid_presc[valid_presc_len] = p;
+                        valid_presc_len += 1;
+                        presc_seen[p] = true;
+                    }
+                }
+            }
+        }
+    }
 
-        // Prescaler, 96 ticks for sclh/scll. Round up then subtract 1
-        let presc_reg = ((ratio - 1) / 96) as u8;
-        // ratio < 2500 by pclk 250MHz max., therefore presc < 16
+    // Phase 2 (Target): Pick first valid combo — no SCLL/SCLH needed
+    if device_mode == I2CDeviceMode::Target {
+        for p in 0..16usize {
+            for d in 0..16usize {
+                for a in 0..16usize {
+                    if presc_result[p][d][a] {
+                        return (p as u8, 0u8, 0u8, a as u8, d as u8)
+                    }
+                }
+            }
+        }
+    }
 
-        // Actual precale value selected
-        let presc = (presc_reg + 1) as u32;
+    // Phase 2 (Controller): Search SCLL/SCLH for minimum speed error.
+    // Error is computed in integer picoseconds to ensure deterministic tie-breaking:
+    // algebraically equal solutions get exactly equal integer errors, so `<=` keeps
+    // updating and the last-found solution wins — matching CubeMX behaviour.
+    let tsync        = filter_delay + 2.0 * t_i2cclk;
+    let t_i2cclk_ps  = 1_000_000_000_000u64 / ker_ck as u64;
+    let af_ps:    u64 = if af_enabled { 50_000 } else { 0 };
+    let dnf_ps:   u64 = dnf_n as u64 * t_i2cclk_ps;
+    let tsync_ps      = af_ps + dnf_ps + 2 * t_i2cclk_ps;
+    let rise_ps       = rise as u64 * 1_000;
+    let fall_ps       = fall as u64 * 1_000;
+    let target_period_ps = 1_000_000_000_000u64 / target_freq as u64;
 
-        let sclh = ((ratio / presc) - 3) / 3;
-        let scll = (2 * (sclh + 1)) - 1;
+    let mut best_err     = u64::MAX;
+    let mut best_presc_r = 99usize;
+    let mut i1_sel       = 0usize;
+    let mut i2_sel       = 0usize;
+    let mut i3_sel       = 0usize;
 
-        let (sdadel, scldel) = if target_freq > 400_000 {
-            // Fast-mode Plus (Fm+)
-            assert!(ker_ck >= 17_000_000); // See table in datasheet
+    for vi in (0..valid_presc_len).rev() {
+        let p          = valid_presc[vi];
+        let t_presc    = (p + 1) as f64 * t_i2cclk;
+        let t_presc_ps = (p + 1) as u64 * t_i2cclk_ps;
 
-            let sdadel = ker_ck / 8_000_000 / presc;
-            let scldel = ker_ck / 4_000_000 / presc - 1;
+        for i1 in 0..256usize {
+            let tscl_low = (i1 + 1) as f64 * t_presc + tsync;
+            if tscl_low  < TLOW_MIN[idx] { continue; }
+            if t_i2cclk >= (tscl_low - filter_delay) / 4.0 { continue; }
 
-            (sdadel, scldel)
-        } else {
-            // Fast-mode (Fm)
-            assert!(ker_ck >= 8_000_000); // See table in datasheet
+            for i2 in 0..256usize {
+                let tscl_high = (i2 + 1) as f64 * t_presc + tsync;
+                if tscl_high < THIGH_MIN[idx] { continue; }
+                if t_i2cclk >= tscl_high { continue; }
 
-            let sdadel = ker_ck / 3_000_000 / presc;
-            let scldel = ker_ck / 1_000_000 / presc - 1;
+                let tscl_ps = (i1 + 1) as u64 * t_presc_ps + tsync_ps
+                            + (i2 + 1) as u64 * t_presc_ps + tsync_ps
+                            + rise_ps + fall_ps;
+                let err = if tscl_ps > target_period_ps {
+                    tscl_ps - target_period_ps
+                } else {
+                    target_period_ps - tscl_ps
+                };
 
-            (sdadel, scldel)
-        };
+                if err <= best_err && p <= best_presc_r {
+                    best_presc_r = p;
+                    best_err     = err;
+                    i1_sel       = i1;
+                    i2_sel       = i2;
+                    i3_sel       = vi;
+                }
+            }
+        }
+    }
 
-        (
-            presc_reg,
-            scll as u8,
-            sclh as u8,
-            sdadel as u8,
-            scldel as u8,
-        )
+    assert!(best_err != u64::MAX, "No solution found!");
+
+    let chosen_p = valid_presc[i3_sel];
+    let mut scldel_out = 0usize;
+    let mut sdadel_out = 0usize;
+    'outer: for d in 0..16usize {
+        for a in 0..16usize {
+            if presc_result[chosen_p][d][a] {
+                scldel_out = d;
+                sdadel_out = a;
+                break 'outer;
+            }
+        }
+    }
+    (chosen_p as u8, i1_sel as u8, i2_sel as u8, sdadel_out as u8, scldel_out as u8)
+}
+
+/// Runs one call to `calc_timing_params_full` with the given clock and returns the result.
+/// Intended to be called repeatedly from an example for hardware benchmarking.
+///
+/// # Arguments
+/// * `ker_ck` - I2C peripheral clock in Hz (e.g. 250_000_000)
+/// * `target_freq` - Target I2C bus speed in Hz
+/// * `rise_ns` - Expected SCL/SDA rise time in nanoseconds
+/// * `fall_ns` - Expected SCL/SDA fall time in nanoseconds
+pub fn calc_timing_bench(ker_ck: u32, target_freq: u32, rise_ns: u32, fall_ns: u32) -> (u8, u8, u8, u8, u8) {
+    let mode = if target_freq > 400_000 {
+        I2CBusMode::FastModePlus
+    } else if target_freq > 100_000 {
+        I2CBusMode::FastMode
     } else {
-        // Standard-mode (Sm)
-        // here we pick SCLL = SCLH
-        assert!(ker_ck >= 2_000_000); // See table in datsheet
-
-        // Prescaler, 128 or 256 ticks for sclh/scll. Round up then
-        // subtract 1
-        let presc_reg = (ratio - 1)
-            / if target_freq < 8000 {
-                256
-            } else if target_freq < 80_000 {
-                128
-            } else {
-                64
-            };
-        let presc_reg = core::cmp::min(presc_reg, 15) as u8;
-
-        // Actual prescale value selected
-        let presc = (presc_reg + 1) as u32;
-
-        let sclh = ((ratio / presc) - 2) / 2;
-        let scll = sclh;
-
-        // Speed check
-        assert!(
-            sclh < 256,
-            "The I2C PCLK is too fast for this bus frequency!"
-        );
-
-        let sdadel = ker_ck / 2_000_000 / presc;
-        let scldel = ker_ck / 500_000 / presc - 1;
-
-        (
-            presc_reg,
-            scll as u8,
-            sclh as u8,
-            sdadel as u8,
-            scldel as u8,
-        )
+        I2CBusMode::StandardMode
     };
+    calc_timing_params_full(ker_ck, target_freq, mode, rise_ns, fall_ns, true, 0, I2CDeviceMode::Controller)
+}
 
-    // Sanity check
-    assert!(presc_reg < 16);
+/// Calculate I2C timing parameters using default values
+fn calc_timing_params(ker_ck: u32, target_freq: u32) -> (u8, u8, u8, u8, u8) {
+    let mode = match target_freq {
+        target_freq if target_freq > 400_000 => I2CBusMode::FastModePlus,
+        target_freq if target_freq > 100_000 => I2CBusMode::FastMode,
+        _ => I2CBusMode::StandardMode
+    };
+    let rise = 100;
+    let fall = 100;
+    let af_enabled = true;
+    let dnf_n = 0;
+    let device_mode = I2CDeviceMode::Controller;
 
-    // Keep values within reasonable limits for fast per_ck
-    let sdadel = core::cmp::max(sdadel, 1);
-    let scldel = core::cmp::max(scldel, 4);
-
-    let sdadel = core::cmp::min(sdadel, 15);
-    let scldel = core::cmp::min(scldel, 15);
-
-    (presc_reg, scll, sclh, sdadel, scldel)
+    calc_timing_params_full(ker_ck, target_freq, mode, rise, fall, af_enabled, dnf_n, device_mode)
 }
 
 fn configure_target_addresses<I2C: Instance>(i2c: &I2C, config: TargetConfig) {
@@ -1617,7 +1722,8 @@ impl<I2C> I2cTarget<I2C, SwitchRole> {
 
 #[cfg(test)]
 mod tests {
-    use crate::i2c::calc_timing_params;
+    use super::I2CBusMode;
+    use crate::i2c::{I2CDeviceMode, calc_timing_params, calc_timing_params_full};
 
     /// Runs a timing testcase over PCLK and I2C clock ranges
     fn i2c_timing_testcase<F>(f: F)
@@ -1827,5 +1933,54 @@ mod tests {
             assert!(scldel <= 15);
             assert!(t_scldel >= t_scldel_minimum);
         });
+    }
+
+    #[test]
+    /// Timing values calculated should match up with those emitted by the official STM32CubeMX tool
+    fn test_timing_calculation_is_deterministic() {
+        let speed = 100_000;
+        let clk_freq = 100_000_000;
+        let mode = I2CBusMode::StandardMode;
+        let rise = 25;
+        let fall = 15;
+        let i2c_timingr = 0x10D0EAFF;
+        let presc = 1;
+        let scldel = 13;
+        let sdadel = 0;
+        let sclh = 234;
+        let scll = 255;
+        let r =
+            calc_timing_params_full(clk_freq, speed, mode, rise, fall, true, 0, I2CDeviceMode::Controller);
+        assert_eq!(r, (presc, scll, sclh, sdadel, scldel));
+
+        let speed = 1_000_000;
+        let clk_freq = 100_000_000;
+        let mode = I2CBusMode::FastModePlus;
+        let rise = 15;
+        let fall = 5;
+        let i2c_timingr = 0x00601240;
+        let presc = 0;
+        let scldel = 6;
+        let sdadel = 0;
+        let sclh = 18;
+        let scll = 64;
+        let r =
+            calc_timing_params_full(clk_freq, speed, mode, rise, fall, true, 0, I2CDeviceMode::Controller);
+        assert_eq!(r, (presc, scll, sclh, sdadel, scldel));
+
+        let speed = 300_000;
+        let clk_freq = 250_000_000;
+        let mode = I2CBusMode::FastMode;
+        let rise = 25;
+        let fall = 15;
+        let i2c_timingr = 0x10F08CFF;
+        let presc = 1;
+        let scldel = 15;
+        let sdadel = 0;
+        let sclh = 140;
+        let scll = 255;
+        let r =
+            calc_timing_params_full(clk_freq, speed, mode, rise, fall, true, 0, I2CDeviceMode::Controller);
+        assert_eq!(r, (presc, scll, sclh, sdadel, scldel));
     }
 }
