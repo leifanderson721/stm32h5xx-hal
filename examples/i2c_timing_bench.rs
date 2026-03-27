@@ -14,12 +14,7 @@ mod utilities;
 
 use cortex_m_rt::entry;
 use log::info;
-use stm32h5xx_hal::{
-    dwt::DwtExt,
-    i2c::calc_timing_bench,
-    pac,
-    prelude::*,
-};
+use stm32h5xx_hal::{dwt::DwtExt, i2c::calc_timing_bench, pac, prelude::*};
 
 // const N: usize = 100;
 const N: usize = 5;
@@ -44,7 +39,10 @@ fn main() -> ! {
     let ker_clk = ccdr.clocks.sys_ck().raw();
     let dwt = cp.DWT.constrain(cp.DCB, &ccdr.clocks);
 
-    info!("I2C timing benchmark: N={}, target={} Hz, ker_clk={} Hz", N, TARGET_FREQ, ker_clk);
+    info!(
+        "I2C timing benchmark: N={}, target={} Hz, ker_clk={} Hz",
+        N, TARGET_FREQ, ker_clk
+    );
 
     let mut samples = [0u32; N];
     let mut result = (0u8, 0u8, 0u8, 0u8, 0u8);
@@ -57,8 +55,10 @@ fn main() -> ! {
     }
 
     // prevent optimizer from eliding the calls
-    info!("result (presc,scll,sclh,sdadel,scldel): ({},{},{},{},{})",
-        result.0, result.1, result.2, result.3, result.4);
+    info!(
+        "result (presc,scll,sclh,sdadel,scldel): ({},{},{},{},{})",
+        result.0, result.1, result.2, result.3, result.4
+    );
 
     // stats
     let min = samples.iter().copied().min().unwrap_or(0);
@@ -66,19 +66,23 @@ fn main() -> ! {
     let sum: u64 = samples.iter().map(|&x| x as u64).sum();
     let mean = sum / N as u64;
 
-    let variance: f32 = samples.iter()
+    let variance: f32 = samples
+        .iter()
         .map(|&x| {
             let diff = x as f32 - mean as f32;
             diff * diff
         })
-        .sum::<f32>() / N as f32;
+        .sum::<f32>()
+        / N as f32;
     let stddev = {
         // Newton-Raphson sqrt (no libm needed in no_std)
         if variance == 0.0 {
             0.0f32
         } else {
             let mut x = variance;
-            for _ in 0..20 { x = 0.5 * (x + variance / x); }
+            for _ in 0..20 {
+                x = 0.5 * (x + variance / x);
+            }
             x
         }
     };
